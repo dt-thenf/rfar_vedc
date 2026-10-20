@@ -1,9 +1,8 @@
 #include <math.h>
-#include <string.h>
+#include <stdint.h>
 #include "Compass_Module.h"
 
 namespace {
-  // Kiểu dữ liệu và phép toán vector 3D
   struct Vec3 {
     float x, y, z;
     Vec3() : x(0.0f), y(0.0f), z(0.0f) {}
@@ -13,6 +12,7 @@ namespace {
   struct AxisMap {
     uint8_t src[3];
     int8_t sign[3];
+
     AxisMap(uint8_t s0, uint8_t s1, uint8_t s2,
             int8_t sg0, int8_t sg1, int8_t sg2) {
       src[0] = s0; src[1] = s1; src[2] = s2;
@@ -50,57 +50,100 @@ namespace {
 
   static Vec3 vNormalize(const Vec3 &a) {
     const float n = vNorm(a);
-    if (n < 1.0e-9f) return Vec3(0.0f, 0.0f, 0.0f);
+    if (!isfinite(n) || n < 1.0e-9f) return Vec3();
     return vScale(a, 1.0f / n);
   }
 
-  static float clampfLocal(float x, float lo, float hi) {
-    return x < lo ? lo : (x > hi ? hi : x);
+  static float clampfLocal(float value, float low, float high) {
+    if (value < low) return low;
+    if (value > high) return high;
+    return value;
   }
 
-  static float wrap360(float deg) {
-    while (deg >= 360.0f) deg -= 360.0f;
-    while (deg < 0.0f) deg += 360.0f;
-    return deg;
+  static float wrap360(float degrees) {
+    if (!isfinite(degrees)) return NAN;
+    degrees = fmodf(degrees, 360.0f);
+    if (degrees < 0.0f) degrees += 360.0f;
+    return degrees;
   }
 
-  static float wrap180(float deg) {
-    deg = wrap360(deg);
-    if (deg > 180.0f) deg -= 360.0f;
-    return deg;
+  static float wrap180(float degrees) {
+    degrees = wrap360(degrees);
+    if (!isfinite(degrees)) return NAN;
+    if (degrees > 180.0f) degrees -= 360.0f;
+    return degrees;
   }
 
-  static Vec3 applyAxisMap(const Vec3 &in, const AxisMap &m) {
-    const float a[3] = {in.x, in.y, in.z};
+  static Vec3 applyAxisMap(const Vec3 &input, const AxisMap &map) {
+    const float values[3] = {input.x, input.y, input.z};
     return Vec3(
-      a[m.src[0]] * m.sign[0],
-      a[m.src[1]] * m.sign[1],
-      a[m.src[2]] * m.sign[2]
+      values[map.src[0]] * map.sign[0],
+      values[map.src[1]] * map.sign[1],
+      values[map.src[2]] * map.sign[2]
     );
   }
 
-  // Quy ước hệ trục tọa độ
+  /*
+   * Body frame follows the HMC5883L mounting specified for this device:
+   *   +X = up, +Y = wearer's left, -Z = forward.
+   *
+   * These identity maps assume ADXL345, ITG3200 and HMC5883L axes are
+   * physically aligned. If the boards/chips are rotated relative to one
+   * another, change each map so all three measurements use the same frame.
+   */
   static const AxisMap ACCEL_MAP(0, 1, 2, +1, +1, +1);
   static const AxisMap GYRO_MAP (0, 1, 2, +1, +1, +1);
   static const AxisMap MAG_MAP  (0, 1, 2, +1, +1, +1);
 
-  // Quy ước hướng đeo trên cơ thể: Hướng tiến là -Z
   static const Vec3 FORWARD_BODY(0.0f, 0.0f, -1.0f);
 
-  // Bộ ước lượng vector trọng lực
+  /*
+   * HMC5883L calibration. Offsets are in microtesla because the Adafruit
+   * Unified Sensor driver reports event.magnetic in uT. Keep defaults neutral
+   * until calibration measurements have been collected on the final assembly.
+   *
+   * Hard-iron: subtract the three offsets.
+   * Soft-iron: apply per-axis gains after offset subtraction. This diagonal
+   * correction improves scale mismatch; a full ellipsoid fit is better when
+   * the enclosure or nearby metal causes cross-axis distortion.
+   */
+  static const Vec3 MAG_HARD_IRON_OFFSET_UT(0.0f, 0.0f, 0.0f);
+  static const Vec3 MAG_SOFT_IRON_SCALE(1.0f, 1.0f, 1.0f);
+
+  /*
+   * East-positive magnetic declination, in degrees. Set this for the deployment
+   * location if XY is intended to align with true north/east. Zero means the
+   * output remains relative to magnetic north.
+   */
+  static const float MAGNETIC_DECLINATION_DEG = 0.0f;
+
+  static const float DEG_TO_RAD = 0.01745329251994329577f;
+  static const float RAD_TO_DEG = 57.29577951308232f;
+
+  static const float MAG_FIELD_MIN_UT = 10.0f;
+  static const float MAG_FIELD_MAX_UT = 100.0f;
+  static const float MIN_HORIZONTAL_FIELD_RATIO = 0.10f;
+  static const float MIN_FORWARD_HORIZONTAL = 0.20f;
+  static const uint32_t HEADING_VALID_TIMEOUT_US = 300000UL;
+
+  /*
+   * Gyro-propagated gravity direction with accelerometer correction.
+   * upBody is the upward direction expressed in the sensor/body frame. The
+   * accelerometer correction is down-weighted when |a| is far from 1 g, since
+   * walking/impact acceleration must not be mistaken for gravity.
+   */
   class GravityEstimator {
   public:
     bool initialized;
     Vec3 upBody;
 
-    GravityEstimator()
-        : initialized(false),
-          upBody(0.0f, 0.0f, 1.0f) {}
+    GravityEstimator() : initialized(false), upBody(1.0f, 0.0f, 0.0f) {}
 
     void resetFromAccel(const Vec3 &accelG) {
-      if (vNorm(accelG) < 0.2f) return;
+      const float magnitude = vNorm(accelG);
+      if (!isfinite(magnitude) || magnitude < 0.2f) return;
       upBody = vNormalize(accelG);
-      initialized = true;
+      initialized = (vNorm(upBody) > 0.5f);
     }
 
     void update(const Vec3 &accelG, const Vec3 &gyroDps, float dt) {
@@ -109,160 +152,179 @@ namespace {
         if (!initialized) return;
       }
 
-      const float DEG2RAD = 0.01745329251994329577f;
-      const Vec3 omega = vScale(gyroDps, DEG2RAD);
+      if (isfinite(gyroDps.x) && isfinite(gyroDps.y) &&
+          isfinite(gyroDps.z) && dt > 0.0f) {
+        const Vec3 omega = vScale(gyroDps, DEG_TO_RAD);
 
-      // Tích phân cập nhật hướng: du/dt = up x omega
-      const Vec3 du = vCross(upBody, omega);
-      upBody = vNormalize(vAdd(upBody, vScale(du, dt)));
-
-      // Hiệu chỉnh bằng gia tốc kế khi độ lớn xấp xỉ 1 g
-      const float amag = vNorm(accelG);
-      if (amag > 0.55f && amag < 1.45f) {
-        const Vec3 aHat = vNormalize(accelG);
-        const float dev = fabsf(amag - 1.0f);
-        float confidence = 1.0f - clampfLocal(dev / 0.25f, 0.0f, 1.0f);
-        confidence *= confidence;
-
-        const float alpha = (1.0f - expf(-dt / 0.45f)) * confidence;
-        upBody = vNormalize(
-          vAdd(
-            vScale(upBody, 1.0f - alpha),
-            vScale(aHat, alpha)
-          )
+        // In body coordinates: d(up)/dt = up x angular_velocity.
+        const Vec3 derivative = vCross(upBody, omega);
+        const Vec3 predicted = vNormalize(
+          vAdd(upBody, vScale(derivative, dt))
         );
+        if (vNorm(predicted) > 0.5f) upBody = predicted;
       }
+
+      const float accelMagnitude = vNorm(accelG);
+      if (!isfinite(accelMagnitude) ||
+          accelMagnitude < 0.55f || accelMagnitude > 1.45f) {
+        return;
+      }
+
+      const Vec3 measuredUp = vNormalize(accelG);
+      if (vNorm(measuredUp) < 0.5f) return;
+
+      const float deviation = fabsf(accelMagnitude - 1.0f);
+      float confidence = 1.0f - clampfLocal(deviation / 0.30f, 0.0f, 1.0f);
+      confidence *= confidence;
+
+      // Complementary correction: slow enough to reject gait acceleration.
+      const float alpha = (1.0f - expf(-dt / 0.55f)) * confidence;
+      const Vec3 corrected = vNormalize(
+        vAdd(vScale(upBody, 1.0f - alpha), vScale(measuredUp, alpha))
+      );
+      if (vNorm(corrected) > 0.5f) upBody = corrected;
     }
   };
+
   static GravityEstimator gravityEstimator;
 
-  // Giải thuật tính toán góc phương vị bù nghiêng
-  static const float MIN_FORWARD_HORIZONTAL = 0.17f;
-
+  /*
+   * General 3D tilt compensation:
+   * 1. Estimate vertical (up) in the sensor frame.
+   * 2. Remove the vertical component from the magnetic field.
+   * 3. Project the device's -Z forward axis onto the horizontal plane.
+   * 4. Compute the signed clockwise angle from magnetic north to forward.
+   *
+   * This vector form works with the non-standard mounting (+X up, +Y left,
+   * -Z forward) without assuming that gravity is always on one sensor axis.
+   */
   static bool computeRawHeading(const Vec3 &magRaw, float &outHeadingDeg) {
     if (!gravityEstimator.initialized) return false;
 
+    const Vec3 mag = Vec3(
+      (magRaw.x - MAG_HARD_IRON_OFFSET_UT.x) * MAG_SOFT_IRON_SCALE.x,
+      (magRaw.y - MAG_HARD_IRON_OFFSET_UT.y) * MAG_SOFT_IRON_SCALE.y,
+      (magRaw.z - MAG_HARD_IRON_OFFSET_UT.z) * MAG_SOFT_IRON_SCALE.z
+    );
+
+    const float magMagnitude = vNorm(mag);
+    if (!isfinite(magMagnitude) ||
+        magMagnitude < MAG_FIELD_MIN_UT ||
+        magMagnitude > MAG_FIELD_MAX_UT) {
+      return false;
+    }
+
     const Vec3 up = vNormalize(gravityEstimator.upBody);
-    const Vec3 mag = magRaw;
+    if (vNorm(up) < 0.5f) return false;
 
-    const float magNorm = vNorm(mag);
-    if (magNorm < 1.0e-6f) return false;
+    Vec3 northHorizontal = vSub(mag, vScale(up, vDot(mag, up)));
+    const float horizontalMagnitude = vNorm(northHorizontal);
+    if (!isfinite(horizontalMagnitude) ||
+        horizontalMagnitude < 1.0e-4f ||
+        horizontalMagnitude / magMagnitude < MIN_HORIZONTAL_FIELD_RATIO) {
+      return false;
+    }
+    northHorizontal = vScale(northHorizontal, 1.0f / horizontalMagnitude);
 
-    // Chiếu vector từ trường lên mặt phẳng ngang: northH = B - up * (B . up)
-    Vec3 northH = vSub(mag, vScale(up, vDot(mag, up)));
-    const float northNorm = vNorm(northH);
-    if (northNorm < 1.0e-6f) return false;
-    northH = vScale(northH, 1.0f / northNorm);
-
-    // Chiếu vector hướng tiến lên mặt phẳng ngang
-    Vec3 forwardH = vSub(
+    Vec3 forwardHorizontal = vSub(
       FORWARD_BODY,
       vScale(up, vDot(FORWARD_BODY, up))
     );
-
-    const float forwardHorizontal = vNorm(forwardH);
-    if (forwardHorizontal < MIN_FORWARD_HORIZONTAL) {
-      return false; // Trường hợp hướng tiến gần vuông góc với mặt phẳng ngang
+    const float forwardMagnitude = vNorm(forwardHorizontal);
+    if (!isfinite(forwardMagnitude) ||
+        forwardMagnitude < MIN_FORWARD_HORIZONTAL) {
+      // Forward axis is almost vertical, so a 2D bearing is ill-defined.
+      return false;
     }
+    forwardHorizontal = vScale(forwardHorizontal, 1.0f / forwardMagnitude);
 
-    forwardH = vScale(forwardH, 1.0f / forwardHorizontal);
+    const float sinAngle = vDot(up, vCross(forwardHorizontal, northHorizontal));
+    const float cosAngle = vDot(northHorizontal, forwardHorizontal);
+    const float magneticHeading = atan2f(sinAngle, cosAngle) * RAD_TO_DEG;
 
-    // Tính góc quay theo chiều kim đồng hồ từ Bắc đến hướng tiến
-    const float sinAngle = vDot(up, vCross(forwardH, northH));
-    const float cosAngle = vDot(northH, forwardH);
-
-    float heading = atan2f(sinAngle, cosAngle) * 57.29577951308232f;
-    outHeadingDeg = wrap360(heading);
-    return true;
+    outHeadingDeg = wrap360(magneticHeading + MAGNETIC_DECLINATION_DEG);
+    return isfinite(outHeadingDeg);
   }
 
-  // Bộ lọc làm mượt góc phương vị
-  static bool headingFilterInit = false;
+  static bool headingFilterInitialized = false;
   static float headingFilteredDeg = 0.0f;
 
-  static void resetHeadingFilter(float headingDeg) {
-    headingFilteredDeg = wrap360(headingDeg);
-    headingFilterInit = true;
-  }
-
-  static float updateHeadingFilter(float rawDeg) {
-    if (!headingFilterInit) {
-      resetHeadingFilter(rawDeg);
+  static float updateHeadingFilter(float rawHeadingDeg) {
+    if (!headingFilterInitialized) {
+      headingFilteredDeg = wrap360(rawHeadingDeg);
+      headingFilterInitialized = true;
       return headingFilteredDeg;
     }
 
-    const float err = wrap180(rawDeg - headingFilteredDeg);
-    const float dynamic = clampfLocal(fabsf(err) / 45.0f, 0.0f, 1.0f);
-    const float alpha = 0.04f + 0.18f * dynamic;
+    // Circular low-pass filter: take the shortest path across 0/360 degrees.
+    const float error = wrap180(rawHeadingDeg - headingFilteredDeg);
+    if (!isfinite(error)) return headingFilteredDeg;
 
-    headingFilteredDeg = wrap360(headingFilteredDeg + alpha * err);
+    const float dynamic = clampfLocal(fabsf(error) / 45.0f, 0.0f, 1.0f);
+    const float alpha = 0.06f + 0.22f * dynamic;
+    headingFilteredDeg = wrap360(headingFilteredDeg + alpha * error);
     return headingFilteredDeg;
   }
 
-  // Ánh xạ góc phương vị sang 8 hướng
-  static String headingToDirection(float heading) {
+  static String headingToDirection(float headingDeg) {
     static const char *directions[8] = {
       "N", "NE", "E", "SE", "S", "SW", "W", "NW"
     };
-
-    const int index = ((int)((wrap360(heading) + 22.5f) / 45.0f)) & 7;
+    if (!isfinite(headingDeg)) return "None";
+    const int index = ((int)((wrap360(headingDeg) + 22.5f) / 45.0f)) & 7;
     return String(directions[index]);
   }
 
-  // Biến trạng thái thực thi nội bộ
-  static Vec3 latestMagRaw(0.0f, 0.0f, 0.0f);
-  static bool haveMagData = false;
+  static bool haveValidHeading = false;
+  static uint32_t lastValidHeadingUs = 0;
   static uint32_t lastUpdateUs = 0;
-
   static float currentCompassValue = 0.0f;
   static String currentCompassHeading = "N";
-
 } // namespace
 
-// Hàm thực thi
 void setupCompass() {
   gravityEstimator = GravityEstimator();
-  haveMagData = false;
-  headingFilterInit = false;
+  headingFilterInitialized = false;
   headingFilteredDeg = 0.0f;
+  haveValidHeading = false;
+  lastValidHeadingUs = 0;
   lastUpdateUs = micros();
   currentCompassValue = 0.0f;
   currentCompassHeading = "N";
 }
 
-void processCompassData(float accX, float accY, float accZ, float gyrX, float gyrY, float gyrZ, float magX, float magY, float magZ) {
+void processCompassData(float accX, float accY, float accZ,
+                        float gyrX, float gyrY, float gyrZ,
+                        float magX, float magY, float magZ) {
   const Vec3 accelBody = applyAxisMap(Vec3(accX, accY, accZ), ACCEL_MAP);
-  const Vec3 gyroBody  = applyAxisMap(Vec3(gyrX, gyrY, gyrZ), GYRO_MAP);
+  const Vec3 gyroBody = applyAxisMap(Vec3(gyrX, gyrY, gyrZ), GYRO_MAP);
+  const Vec3 magBody = applyAxisMap(Vec3(magX, magY, magZ), MAG_MAP);
 
   const uint32_t nowUs = micros();
-  float dt = (nowUs - lastUpdateUs) * 1.0e-6f;
+  float dt = (uint32_t)(nowUs - lastUpdateUs) * 1.0e-6f;
   lastUpdateUs = nowUs;
+  if (!isfinite(dt) || dt <= 0.0f || dt > 0.1f) dt = 0.01f;
 
-  if (dt <= 0.0f || dt > 0.1f) { dt = 0.01f; }
-
-  // Cập nhật bộ ước lượng vector trọng lực
   gravityEstimator.update(accelBody, gyroBody, dt);
 
-  // Lưu giữ mẫu từ trường mới nhất
-  latestMagRaw = applyAxisMap(Vec3(magX, magY, magZ), MAG_MAP);
-  haveMagData = true;
-
-  // Tính toán bù nghiêng và cập nhật bộ lọc góc liên tục ở tần số 100 Hz (mỗi 10 ms)
-  if (haveMagData && gravityEstimator.initialized) {
-    float rawHeading = 0.0f;
-    if (computeRawHeading(latestMagRaw, rawHeading)) {
-      currentCompassValue = updateHeadingFilter(rawHeading);
-      currentCompassHeading = headingToDirection(currentCompassValue);
-      static uint16_t printCounter = 0;
-      printCounter++;
-      if (printCounter >= 100) {
-        printCounter = 0;
-        // Serial.printf("[Góc] %5.1f deg %2s\n", currentCompassValue, currentCompassHeading.c_str());
-      }
-    }
+  float rawHeadingDeg = 0.0f;
+  if (computeRawHeading(magBody, rawHeadingDeg)) {
+    currentCompassValue = updateHeadingFilter(rawHeadingDeg);
+    currentCompassHeading = headingToDirection(currentCompassValue);
+    haveValidHeading = true;
+    lastValidHeadingUs = nowUs;
   }
 }
 
-float getCompassValue() { return currentCompassValue; }
-String getCompassHeading() { return currentCompassHeading; }
-bool isCompassReady() { return gravityEstimator.initialized && haveMagData; }
+float getCompassValue() {
+  return currentCompassValue;
+}
+
+String getCompassHeading() {
+  return currentCompassHeading;
+}
+
+bool isCompassReady() {
+  if (!gravityEstimator.initialized || !haveValidHeading) return false;
+  return (uint32_t)(micros() - lastValidHeadingUs) <= HEADING_VALID_TIMEOUT_US;
+}
