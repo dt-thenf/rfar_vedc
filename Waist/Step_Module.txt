@@ -1,0 +1,171 @@
+/*
+ * 1. Slow:   Ts = 0.635 s -> f = 1.575 Hz -> Step length = 0.595 m
+ * 2. Normal: Ts = 0.506 s -> f = 1.972 Hz -> Step length = 0.690 m
+ * 3. Fast:   Ts = 0.469 s -> f = 2.132 Hz -> Step length = 0.797 m
+ * Thiết lập một phương trình đường thẳng mô tả mối quan hệ liên tục: SL = a * (1 / Ts) + b
+ * Bằng phương pháp bình phương tối thiểu khớp hàm theo tần số bước chân, ta xây dựng được phương trình toán học: SL = 0.363 * (1 / Ts) - 0.025
+ */
+
+#include <SimpleKalmanFilter.h>
+#include "Step_Module.h"
+
+// Đối tượng hàng đợi toàn cục của module đếm bước
+static StepQueue_t stepQueue;
+static uint32_t globalSampleIndex = 0; // Chỉ mục thời gian tăng dần mỗi 10ms
+
+// Khởi tạo bộ lọc Kalman với các tham số tối ưu cho gia tốc vùng eo (100Hz)
+static SimpleKalmanFilter kalmanFilter(0.05f, 0.05f, 0.04f);
+
+// Biến lưu trữ kết quả toàn cục
+static uint32_t stepCount = 0;
+static float stepDistance = 0.0f;
+
+// Biến quản lý trạng thái thuật toán
+static uint32_t lastStepTimeIndex = 0;
+static uint32_t lastPeakTimeIndex = 0;
+static int16_t offsetCounter = 0;
+static bool peakDetected = false;
+static float currentPeakValue = 0.0f;
+static uint32_t currentPeakTimeIndex = 0;
+
+void setupStepCounter() {
+  stepQueue_Init(&stepQueue);
+  stepCount = 0;
+  stepDistance = 0.0f;
+  globalSampleIndex = 0;
+  lastStepTimeIndex = 0;
+  lastPeakTimeIndex = 0;
+  offsetCounter = 0;
+  peakDetected = false;
+}
+
+void processStepData(float accX, float accY, float accZ) {
+  globalSampleIndex++;
+  // Tính toán độ lớn vector tổng hợp và áp dụng bộ lọc Kalman
+  float amagRaw = sqrt(accX * accX + accY * accY + accZ * accZ) - 1.0f;
+  float amagFiltered = kalmanFilter.updateEstimate(amagRaw);
+  // Đẩy mẫu mới vào hàng đợi vòng
+  stepQueue_Push(&stepQueue, globalSampleIndex, amagFiltered);
+
+  // Thuật toán cần tối thiểu 51 mẫu (2 * HALF_WINDOW + 1) để bắt đầu phân tích điểm giữa
+  // Kiểm tra xem hàng đợi đã tích lũy đủ số mẫu an toàn chưa
+  if (globalSampleIndex <= (2 * HALF_WINDOW)) {
+    return;
+  }
+
+  // Quản lý biến trễ phục vụ tìm đáy sau khi có đỉnh
+  if (offsetCounter > 0) {
+    offsetCounter--;
+  }
+
+  // Xác định chỉ số mảng của điểm chính giữa cửa sổ trượt (midIndex)
+  // Vì front di chuyển liên tục, ta tìm vị trí tương đối trong mảng xoay vòng
+  int16_t midQueuePos = (stepQueue.front + HALF_WINDOW) % stepQueue.size;
+  float midValue = stepQueue.queueArr[midQueuePos].amag;
+  uint32_t midTimeIndex = stepQueue.queueArr[midQueuePos].sampleIndex;
+
+  // Tìm GTLN và GTNN trong toàn bộ cửa sổ 51 mẫu
+  float maxVal = -10.0f;
+  float minVal =  10.0f;
+  bool isAbsoluteMax = true;
+
+  for (int i = 0; i <= (2 * HALF_WINDOW); i++) {
+    int16_t currentPos = (stepQueue.front + i) % stepQueue.size;
+    float currentVal = stepQueue.queueArr[currentPos].amag;
+
+    if (currentVal > maxVal) maxVal = currentVal;
+    if (currentVal < minVal) minVal = currentVal;
+
+    // Kiểm tra xem điểm chính giữa có phải là điểm cao nhất cục bộ không
+    if (i != HALF_WINDOW && currentVal >= midValue) {
+      isAbsoluteMax = false; // Có điểm khác lớn hơn hoặc bằng nó trong cửa sổ
+    }
+  }
+
+  // Tính toán ngưỡng động và biên độ dao động
+  float dynamicThreshold = (maxVal + minVal) / 2.0f;
+  float deltaAmag = maxVal - minVal;
+
+  // Ngưỡng nhiễu tối thiểu để bỏ qua các rung lắc nhỏ khi đứng yên
+  const float MIN_DELTA_THRESHOLD = 0.14f;
+
+  // Giai đoạn 1: Phát hiện đỉnh
+  if (!peakDetected && offsetCounter == 0) {
+    // Điều kiện chọn đỉnh: Là điểm cao nhất, vượt ngưỡng động và biên độ dao động đủ lớn
+    if (isAbsoluteMax && midValue > dynamicThreshold && deltaAmag >= MIN_DELTA_THRESHOLD) {
+      // Chống đếm trùng thời gian (Thời gian giữa 2 đỉnh liên tiếp phải > 250ms tương đương 25 mẫu)
+      if (midTimeIndex - lastPeakTimeIndex > 25) {
+        peakDetected = true;
+        currentPeakValue = midValue;
+        currentPeakTimeIndex = midTimeIndex;
+
+        // Khóa tìm kiếm trong 5 mẫu tiếp theo (50ms) để sóng gia tốc đi xuống hẳn
+        offsetCounter = 5; 
+      }
+    }
+  }
+
+  // Giai đoạn 2: Phát hiện đáy phía bên phải để chốt bước chân
+  if (peakDetected) {
+    // Ta tìm đáy bằng cách quét các mẫu nằm bên phải của đỉnh cũ 
+    // Điểm midValue hiện tại đang đóng vai trò di chuyển dần về phía bên phải của đỉnh
+    if (midTimeIndex > currentPeakTimeIndex) {
+      // Nếu điểm ở giữa hiện tại rớt xuống dưới ngưỡng động và vùng giá trị âm
+      if (midValue < dynamicThreshold && midValue < 0.0f) {
+        // Xác nhận một bước chân hợp lệ
+        stepCount++;
+        float currentStepLength = 0.65f; // Mặc định nếu là bước đầu tiên
+
+        if (lastStepTimeIndex > 0) {
+          // Tính số mẫu chênh lệch giữa bước này và bước ngay trước đó
+          uint32_t sampleDelta = midTimeIndex - lastStepTimeIndex;
+          // Quy đổi số mẫu sang thời gian một bước Ts (mỗi mẫu = 10ms = 0.01 giây)
+          float Ts = (float)sampleDelta * 0.01f;
+          if (Ts > 0.0f) {
+            // Áp dụng phương trình hồi quy tuyến tính
+            currentStepLength = 0.363f * (1.0f / Ts) - 0.025f;
+            // Biên giới hạn vật lý bước chân người (từ 0.5m đến 0.8m)
+            currentStepLength = constrain(currentStepLength, 0.50f, 0.80f);
+          }
+        }
+
+        // Cộng dồn khoảng cách thích ứng của chính bước chân này vào tổng quãng đường
+        stepDistance += currentStepLength;
+        // Cập nhật mốc thời gian hoàn thành bước chân phục vụ cho bước kế tiếp
+        lastStepTimeIndex = midTimeIndex;
+        lastPeakTimeIndex = currentPeakTimeIndex;
+        // Serial.printf("Bước số: %d | Đỉnh: %.2f g | Đáy: %.2f g\n", stepCount, currentPeakValue, midValue);
+        // Serial.printf("Chiều dài bước này: %.3f m | Tổng quãng đường: %.2f m\n", currentStepLength, stepDistance);
+        // Reset trạng thái để chuẩn bị tìm đỉnh mới
+        peakDetected = false;
+        offsetCounter = 25; // Giữ trễ 250ms trước khi cho phép quét đỉnh tiếp theo
+      }
+    }
+    // Hủy đỉnh nếu đợi quá lâu (> 1.2 giây tương đương 120 mẫu) mà không thấy chân chạm đất
+    if (midTimeIndex - currentPeakTimeIndex > 120) {
+      peakDetected = false;
+    }
+  }
+}
+
+uint32_t getStepCount() { return stepCount; }
+float getStepDistance() { return stepDistance; }
+
+#ifndef STEP_MODULE_H
+#define STEP_MODULE_H
+
+#include <Arduino.h>
+#include "Step_Queue.h"
+
+// Cấu hình tham số cửa sổ trượt (HALF_WINDOW = 25 -> Cửa sổ tổng = 51 mẫu)
+#define HALF_WINDOW 25
+// Khởi tạo module đếm bước
+void setupStepCounter();
+// Tiếp nhận dữ liệu gia tốc 3 trục (g), tính toán Amag-1 và thực hiện đếm bước
+void processStepData(float accX, float accY, float accZ);
+// Trả về số bước chân
+uint32_t getStepCount();
+// Trả về khoảng cách ước tính (m) dựa trên số bước chân
+float getStepDistance();
+
+#endif // STEP_MODULE_H

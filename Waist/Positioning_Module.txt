@@ -1,0 +1,469 @@
+#include <math.h>
+#include <string.h>
+#include "Positioning_Module.h"
+
+namespace {
+  // Không gian tọa độ và cấu hình bản đồ
+  const float MAP_X_MAX_M = 100.0f;
+  const float MAP_Y_MAX_M =  50.0f;
+  // Tọa độ khởi tạo tại trung tâm khu vực khảo sát
+  const float INITIAL_X_M = MAP_X_MAX_M * 0.5f;
+  const float INITIAL_Y_M = MAP_Y_MAX_M * 0.5f;
+
+  // Máy trạng thái PDR và các tham số lọc hướng
+  enum PdrState {
+    PDR_WAIT_HEADING = 0,
+    PDR_TURNING,
+    PDR_STRAIGHT_WALK
+  };
+  PdrState currentPdrState = PDR_WAIT_HEADING;
+  const uint32_t STOP_CONFIRM_INTERVAL_MS = 1200UL;
+
+  // Ngưỡng vận tốc góc phân định chuyển động xoay (deg/s)
+  const float GYRO_TURNING_THRESHOLD_DPS = 20.0f;
+  const float GYRO_STABLE_THRESHOLD_DPS  = 10.0f;
+
+  // Cửa sổ trượt lấy mẫu góc phương vị vòng
+  const uint8_t  HEADING_WINDOW_CAPACITY    = 24;
+  const uint8_t  HEADING_MIN_SAMPLES        = 12;
+  const uint32_t HEADING_SAMPLE_INTERVAL_MS = 25UL;
+  const uint32_t HEADING_STABLE_MIN_MS      = 300UL;
+  const float    HEADING_MAX_SPREAD_DEG     = 8.0f;
+
+  float headingBuffer[HEADING_WINDOW_CAPACITY];
+  uint8_t headingBufferCount = 0;
+  uint8_t headingBufferWriteIdx = 0;
+  uint32_t headingFirstSampleMs = 0;
+  uint32_t headingLastSampleMs  = 0;
+
+  PDRPosition currentPosition = {};
+
+  uint32_t processedStepCount = 0;
+  float processedDistanceM = 0.0f;
+  bool isInitialStepSyncNeeded = true;
+
+  float lockedHeadingDeg = NAN;
+  bool isWalkingSegmentOpen = false;
+
+  bool hasRecentStepTimestamp = false;
+  uint32_t recentStepTimestampMs = 0;
+
+  bool isTurnReportedWhileWalking = false;
+
+  // Tọa độ thực tế trước khi áp dụng hàm giới hạn không gian
+  float rawPositionXM = INITIAL_X_M;
+  float rawPositionYM = INITIAL_Y_M;
+
+  // Các hàm toán học và hỗ trợ nội bộ
+  float clampFloat(float value, float minValue, float maxValue) {
+    if (value < minValue) return minValue;
+    if (value > maxValue) return maxValue;
+    return value;
+  }
+
+  float normalizeAngle360(float headingDeg) {
+    if (!isfinite(headingDeg) || headingDeg < 0.0f) return NAN;
+    while (headingDeg >= 360.0f) headingDeg -= 360.0f;
+    while (headingDeg < 0.0f) headingDeg += 360.0f;
+    return headingDeg;
+  }
+
+  float getSmallestAngleDifference(float angleA, float angleB) {
+    float diff = normalizeAngle360(angleA) - normalizeAngle360(angleB);
+    while (diff > 180.0f) diff -= 360.0f;
+    while (diff < -180.0f) diff += 360.0f;
+    return diff;
+  }
+
+  // Kiểm tra hành động di chuyển dựa trên tập nhãn của mô hình HAR
+  bool isMovementActivity(const String &act) { return (act == "WA" || act == "JO" || act == "WS"); }
+  String angleToDirectionString(float headingDeg) {
+    headingDeg = normalizeAngle360(headingDeg);
+    if (!isfinite(headingDeg)) return "None";
+    static const char *directions[8] = {"N", "NE", "E", "SE", "S", "SW", "W", "NW"};
+    const int index = ((int)((headingDeg + 22.5f) / 45.0f)) & 7;
+    return String(directions[index]);
+  }
+
+  const char *getPdrStateName(PdrState state) {
+    switch (state) {
+      case PDR_TURNING:
+        return "TURNING";
+      case PDR_STRAIGHT_WALK:
+        return "STRAIGHT_WALK";
+      case PDR_WAIT_HEADING:
+      default:
+        return "WAIT_HEADING";
+    }
+  }
+
+  void updatePdrState(PdrState state) {
+    currentPdrState = state;
+    currentPosition.pdrState = getPdrStateName(state);
+  }
+
+  void resetHeadingWindow() {
+    headingBufferCount = 0;
+    headingBufferWriteIdx = 0;
+    headingFirstSampleMs = 0;
+    headingLastSampleMs = 0;
+  }
+
+  void pushHeadingSample(float headingDeg, uint32_t currentMs) {
+    headingDeg = normalizeAngle360(headingDeg);
+    if (!isfinite(headingDeg)) return;
+    if (headingLastSampleMs != 0 &&
+        (uint32_t)(currentMs - headingLastSampleMs) < HEADING_SAMPLE_INTERVAL_MS) {
+      return;
+    }
+    headingLastSampleMs = currentMs;
+    if (headingBufferCount == 0) { headingFirstSampleMs = currentMs; }
+    headingBuffer[headingBufferWriteIdx] = headingDeg;
+    headingBufferWriteIdx = (uint8_t)((headingBufferWriteIdx + 1) % HEADING_WINDOW_CAPACITY);
+    if (headingBufferCount < HEADING_WINDOW_CAPACITY) { headingBufferCount++; }
+  }
+
+  // Tính toán giá trị trung bình vòng và độ phân tán góc
+  bool computeStableHeading(uint32_t currentMs, float &meanDeg, float &spreadDeg) {
+    meanDeg = NAN;
+    spreadDeg = 999.0f;
+
+    if (headingBufferCount < HEADING_MIN_SAMPLES) return false;
+    if (headingFirstSampleMs == 0 ||
+        (uint32_t)(currentMs - headingFirstSampleMs) < HEADING_STABLE_MIN_MS) {
+      return false;
+    }
+
+    float sumSin = 0.0f;
+    float sumCos = 0.0f;
+    for (uint8_t i = 0; i < headingBufferCount; ++i) {
+      const float rad = headingBuffer[i] * (PI / 180.0f);
+      sumSin += sinf(rad);
+      sumCos += cosf(rad);
+    }
+
+    const float count = (float)headingBufferCount;
+    const float resultantLength = sqrtf(sumSin * sumSin + sumCos * sumCos) / count;
+
+    meanDeg = atan2f(sumSin, sumCos) * (180.0f / PI);
+    meanDeg = normalizeAngle360(meanDeg);
+
+    float maxSpread = 0.0f;
+    for (uint8_t i = 0; i < headingBufferCount; ++i) {
+      const float diff = fabsf(getSmallestAngleDifference(headingBuffer[i], meanDeg));
+      if (diff > maxSpread) maxSpread = diff;
+    }
+
+    spreadDeg = maxSpread;
+    return (resultantLength >= 0.985f && spreadDeg <= HEADING_MAX_SPREAD_DEG);
+  }
+
+  void closeWalkingSegment() {
+    isWalkingSegmentOpen = false;
+    lockedHeadingDeg = NAN;
+    currentPosition.lockedHeading = "None";
+    currentPosition.isMoving = false;
+    hasRecentStepTimestamp = false;
+    isTurnReportedWhileWalking = false;
+  }
+
+  void enterWaitHeadingState() {
+    closeWalkingSegment();
+    resetHeadingWindow();
+    updatePdrState(PDR_WAIT_HEADING);
+  }
+
+  void enterTurningState() {
+    closeWalkingSegment();
+    resetHeadingWindow();
+    updatePdrState(PDR_TURNING);
+  }
+
+  void lockNewHeading(float headingDeg, float spreadDeg) {
+    lockedHeadingDeg = normalizeAngle360(headingDeg);
+    if (!isfinite(lockedHeadingDeg)) return;
+    isWalkingSegmentOpen = true;
+    currentPosition.lockedHeading = angleToDirectionString(lockedHeadingDeg);
+    currentPosition.headingSpreadDeg = spreadDeg;
+    updatePdrState(PDR_STRAIGHT_WALK);
+  }
+
+  void updateConfidenceMetric() {
+    float confidence = 1.0f;
+    confidence -= clampFloat(currentPosition.distanceSinceAnchorM / 220.0f, 0.0f, 0.45f);
+    confidence -= clampFloat(currentPosition.headingSpreadDeg / 80.0f, 0.0f, 0.15f);
+    if (currentPosition.isBoundaryHit) { confidence -= 0.15f; }
+    confidence -= clampFloat((float)currentPosition.turnWhileMovingCount * 0.02f, 0.0f, 0.15f);
+    currentPosition.relativeConfidence = clampFloat(confidence, 0.0f, 1.0f);
+  }
+
+  // Cập nhật tích phân tọa độ dead reckoning
+  void integrateSteps(uint32_t newSteps, float deltaDistanceM) {
+    if (newSteps == 0 || !isfinite(lockedHeadingDeg) || deltaDistanceM <= 0.0f) return;
+    currentPosition.stepLengthM = deltaDistanceM / (float)newSteps;
+
+    const float rad = lockedHeadingDeg * (PI / 180.0f);
+    // Quy ước phương vị địa lý: 0° (Bắc) -> dY+, 90° (Đông) -> dX+
+    const float deltaX = deltaDistanceM * sinf(rad);
+    const float deltaY = deltaDistanceM * cosf(rad);
+
+    rawPositionXM += deltaX;
+    rawPositionYM += deltaY;
+    currentPosition.distanceSinceAnchorM += deltaDistanceM;
+
+    const float boundedX = clampFloat(rawPositionXM, 0.0f, MAP_X_MAX_M);
+    const float boundedY = clampFloat(rawPositionYM, 0.0f, MAP_Y_MAX_M);
+    currentPosition.isBoundaryHit = (fabsf(boundedX - rawPositionXM) > 0.0001f || fabsf(boundedY - rawPositionYM) > 0.0001f);
+    if (currentPosition.isBoundaryHit) { currentPosition.boundaryHitCount++; }
+
+    currentPosition.rawXM = rawPositionXM;
+    currentPosition.rawYM = rawPositionYM;
+    currentPosition.xM = boundedX;
+    currentPosition.yM = boundedY;
+    updateConfidenceMetric();
+  }
+} // namespace
+
+void setupPositioning() {
+  currentPosition.xMaxM = MAP_X_MAX_M;
+  currentPosition.yMaxM = MAP_Y_MAX_M;
+  resetPosition(INITIAL_X_M, INITIAL_Y_M);
+}
+
+void processPositioning(const String &rawAct, uint32_t totalSteps, float totalDistanceM, float headingDeg, float gyroMagnitudeDps, bool isCompassReady) {
+  const uint32_t now = millis();
+  currentPosition.isBoundaryHit = false;
+
+  // Đồng bộ bước chân trong chu kỳ khởi động
+  if (isInitialStepSyncNeeded) {
+    processedStepCount = totalSteps;
+    processedDistanceM = totalDistanceM;
+    isInitialStepSyncNeeded = false;
+  }
+
+  // Phát hiện khởi động lại từ bộ đếm bước
+  if (totalSteps < processedStepCount ||
+      !isfinite(totalDistanceM) ||
+      totalDistanceM + 0.0001f < processedDistanceM) {
+    processedStepCount = totalSteps;
+    processedDistanceM = isfinite(totalDistanceM) ? totalDistanceM : 0.0f;
+    enterWaitHeadingState();
+    return;
+  }
+
+  const uint32_t newSteps = totalSteps - processedStepCount;
+  const float deltaDistanceM = totalDistanceM - processedDistanceM;
+  const bool hasPendingSteps = (newSteps > 0 || deltaDistanceM > 0.0001f);
+  const bool isMovingAct = isMovementActivity(rawAct);
+  const bool shouldContinuePdr = (isMovingAct || hasPendingSteps);
+
+  // Trường hợp 1: Không có bước chờ xử lý và người dùng ở trạng thái tĩnh
+  if (!shouldContinuePdr) {
+    currentPosition.isMoving = false;
+    if (isWalkingSegmentOpen) {
+      if (!hasRecentStepTimestamp ||
+          (uint32_t)(now - recentStepTimestampMs) >= STOP_CONFIRM_INTERVAL_MS) {
+        closeWalkingSegment();
+      }
+    }
+
+    if (gyroMagnitudeDps >= GYRO_TURNING_THRESHOLD_DPS) {
+      if (currentPdrState != PDR_TURNING) {
+        enterTurningState();
+      }
+      return;
+    }
+
+    if (currentPdrState == PDR_TURNING && gyroMagnitudeDps <= GYRO_STABLE_THRESHOLD_DPS) {
+      resetHeadingWindow();
+      updatePdrState(PDR_WAIT_HEADING);
+    } else if (currentPdrState != PDR_WAIT_HEADING && !isWalkingSegmentOpen) {
+      updatePdrState(PDR_WAIT_HEADING);
+    }
+
+    if (isCompassReady && gyroMagnitudeDps <= GYRO_STABLE_THRESHOLD_DPS) {
+      pushHeadingSample(headingDeg, now);
+    } else if (!isCompassReady) {
+      resetHeadingWindow();
+    }
+    return;
+  }
+
+  // Trường hợp 2: Hướng di chuyển đã được khóa, áp dụng trực tiếp bước chân
+  if (isWalkingSegmentOpen) {
+    if (gyroMagnitudeDps >= GYRO_TURNING_THRESHOLD_DPS) {
+      if (!isTurnReportedWhileWalking) {
+        currentPosition.turnWhileMovingCount++;
+        isTurnReportedWhileWalking = true;
+        updateConfidenceMetric();
+      }
+    } else if (gyroMagnitudeDps <= GYRO_STABLE_THRESHOLD_DPS) {
+      isTurnReportedWhileWalking = false;
+    }
+
+    if (hasPendingSteps && newSteps > 0) {
+      integrateSteps(newSteps, deltaDistanceM);
+
+      processedStepCount = totalSteps;
+      processedDistanceM = totalDistanceM;
+
+      currentPosition.isMoving = true;
+      hasRecentStepTimestamp = true;
+      recentStepTimestampMs = now;
+      updatePdrState(PDR_STRAIGHT_WALK);
+      return;
+    }
+
+    if (!isMovingAct && hasRecentStepTimestamp && (uint32_t)(now - recentStepTimestampMs) >= STOP_CONFIRM_INTERVAL_MS) {
+      closeWalkingSegment();
+      updatePdrState(PDR_WAIT_HEADING);
+      return;
+    }
+
+    currentPosition.isMoving = isMovingAct;
+    return;
+  }
+
+  // Trường hợp 3: Chưa khóa hướng, bảo toàn số bước chờ
+  currentPosition.isMoving = false;
+
+  if (hasPendingSteps && newSteps > 0 && isCompassReady) {
+    float meanDeg = NAN;
+    float spreadDeg = 999.0f;
+
+    if (computeStableHeading(now, meanDeg, spreadDeg)) {
+      lockNewHeading(meanDeg, spreadDeg);
+
+      if (isWalkingSegmentOpen) {
+        integrateSteps(newSteps, deltaDistanceM);
+        processedStepCount = totalSteps;
+        processedDistanceM = totalDistanceM;
+
+        currentPosition.isMoving = true;
+        hasRecentStepTimestamp = true;
+        recentStepTimestampMs = now;
+        return;
+      }
+    }
+  }
+
+  if (!hasPendingSteps && gyroMagnitudeDps >= GYRO_TURNING_THRESHOLD_DPS) {
+    if (currentPdrState != PDR_TURNING) {
+      enterTurningState();
+    }
+    return;
+  }
+
+  if (currentPdrState == PDR_TURNING && gyroMagnitudeDps <= GYRO_STABLE_THRESHOLD_DPS) {
+    resetHeadingWindow();
+    updatePdrState(PDR_WAIT_HEADING);
+  } else if (currentPdrState != PDR_WAIT_HEADING) {
+    updatePdrState(PDR_WAIT_HEADING);
+  }
+
+  if (isCompassReady && isfinite(headingDeg) && gyroMagnitudeDps <= GYRO_TURNING_THRESHOLD_DPS) {
+    pushHeadingSample(headingDeg, now);
+  } else if (!isCompassReady && !hasPendingSteps) {
+    resetHeadingWindow();
+  }
+
+  if (!hasPendingSteps || newSteps == 0 || !isCompassReady) { return; }
+  float meanDeg = NAN;
+  float spreadDeg = 999.0f;
+  if (!computeStableHeading(now, meanDeg, spreadDeg)) { return; }
+  lockNewHeading(meanDeg, spreadDeg);
+  if (!isWalkingSegmentOpen) { return; }
+
+  // Tích phân toàn bộ khoảng cách tích lũy ngay khi hướng đạt độ ổn định
+  integrateSteps(newSteps, deltaDistanceM);
+  processedStepCount = totalSteps;
+  processedDistanceM = totalDistanceM;
+
+  currentPosition.isMoving = true;
+  hasRecentStepTimestamp = true;
+  recentStepTimestampMs = now;
+}
+
+PDRPosition getPDRPosition() { return currentPosition; }
+float getPositionX() { return currentPosition.xM; }
+float getPositionY() { return currentPosition.yM; }
+
+void resetPosition(float xM, float yM) {
+  rawPositionXM = xM;
+  rawPositionYM = yM;
+
+  currentPosition.rawXM = rawPositionXM;
+  currentPosition.rawYM = rawPositionYM;
+  currentPosition.xM = clampFloat(rawPositionXM, 0.0f, MAP_X_MAX_M);
+  currentPosition.yM = clampFloat(rawPositionYM, 0.0f, MAP_Y_MAX_M);
+
+  currentPosition.xMaxM = MAP_X_MAX_M;
+  currentPosition.yMaxM = MAP_Y_MAX_M;
+  currentPosition.stepLengthM = 0.65f;
+
+  currentPosition.lockedHeading = "None";
+  currentPosition.isMoving = false;
+  currentPosition.isBoundaryHit = false;
+
+  currentPosition.distanceSinceAnchorM = 0.0f;
+  currentPosition.headingSpreadDeg = 0.0f;
+  currentPosition.relativeConfidence = 1.0f;
+  currentPosition.boundaryHitCount = 0;
+  currentPosition.turnWhileMovingCount = 0;
+  currentPosition.pdrState = "WAIT_HEADING";
+
+  processedStepCount = 0;
+  processedDistanceM = 0.0f;
+  isInitialStepSyncNeeded = true;
+
+  lockedHeadingDeg = NAN;
+  isWalkingSegmentOpen = false;
+  hasRecentStepTimestamp = false;
+  recentStepTimestampMs = 0;
+  isTurnReportedWhileWalking = false;
+
+  resetHeadingWindow();
+  updatePdrState(PDR_WAIT_HEADING);
+}
+
+#ifndef POSITIONING_MODULE_H
+#define POSITIONING_MODULE_H
+
+#include <Arduino.h>
+
+// Cấu trúc lưu trữ dữ liệu vị trí và chẩn đoán định vị PDR
+struct PDRPosition {
+  float xM;
+  float yM;
+  float xMaxM;
+  float yMaxM;
+
+  float stepLengthM;
+  String lockedHeading;
+  bool isMoving;
+  bool isBoundaryHit;
+
+  // Dữ liệu chẩn đoán nội bộ
+  float rawXM;
+  float rawYM;
+  float distanceSinceAnchorM;
+  float headingSpreadDeg;
+  float relativeConfidence;
+  uint32_t boundaryHitCount;
+  uint32_t turnWhileMovingCount;
+  String pdrState;
+};
+
+// Khởi tạo định vị 2D và thiết lập vị trí gốc mặc định (50 m, 25 m)
+void setupPositioning();
+// Cập nhật tọa độ định vị PDR theo chu kỳ lấy mẫu hệ thống
+void processPositioning(const String &rawAct, uint32_t totalSteps, float totalDistanceM, float headingDeg, float gyroMagnitudeDps, bool isCompassReady);
+// Lấy toàn bộ cấu trúc trạng thái vị trí
+PDRPosition getPDRPosition();
+// Lấy tọa độ X và Y phục vụ truyền thông (đã giới hạn trong không gian 100 x 50 m)
+float getPositionX();
+float getPositionY();
+// Đặt lại tọa độ vị trí tức thời
+void resetPosition(float xM, float yM);
+
+#endif // POSITIONING_MODULE_H

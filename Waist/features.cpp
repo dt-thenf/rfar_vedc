@@ -1,0 +1,145 @@
+#include <math.h>
+#include <string.h>
+#include <ArduinoSort.h>
+#include "features.h"
+
+void extractFeatures(float* x, float* y, float* z, float* f, int n) {
+  f[0] = findMean(x, n);        f[1] = findMean(y, n);        f[2] = findMean(z, n);
+  f[3] = findSTD(x, n);         f[4] = findSTD(y, n);         f[5] = findSTD(z, n);
+  f[6] = findRMS(x, n);         f[7] = findRMS(y, n);         f[8] = findRMS(z, n);
+  f[9] = findMax(x, n);         f[10] = findMax(y, n);        f[11] = findMax(z, n);
+  f[12] = findMin(x, n);        f[13] = findMin(y, n);        f[14] = findMin(z, n);
+  f[15] = findRange(x, n);      f[16] = findRange(y, n);      f[17] = findRange(z, n);
+  f[18] = findMedian(x, n);     f[19] = findMedian(y, n);     f[20] = findMedian(z, n);
+  f[21] = findIQR(x, n);        f[22] = findIQR(y, n);        f[23] = findIQR(z, n);
+  f[24] = findSkew(x, n);       f[25] = findSkew(y, n);       f[26] = findSkew(z, n);
+  f[27] = findKurtosis(x, n);   f[28] = findKurtosis(y, n);   f[29] = findKurtosis(z, n);
+  f[30] = findMobility(x, n);   f[31] = findMobility(y, n);   f[32] = findMobility(z, n);
+  f[33] = findComplexity(x, n); f[34] = findComplexity(y, n); f[35] = findComplexity(z, n);
+}
+
+float findMean(float *arr, long n) {
+  float sum = 0.0;
+  for (int i = 0; i < n; i++) sum += arr[i];
+  return sum / n;
+}
+
+float findSTD(float *arr, long n) {
+  float mean = findMean(arr, n), sum = 0.0;
+  for (int i = 0; i < n; i++) {
+    float d = arr[i] - mean;
+    sum += d * d;
+  }
+  return sqrt(sum / n);
+}
+
+float findRMS(float *arr, long n) {
+  float sum = 0.0;
+  for (int i = 0; i < n; i++) sum += arr[i] * arr[i];
+  return sqrt(sum / n);
+}
+
+float findMax(float *arr, long n) {
+  float m = arr[0];
+  for (long i = 1; i < n; i++) if (arr[i] > m) m = arr[i];
+  return m;
+}
+
+float findMin(float *arr, long n) {
+  float m = arr[0];
+  for (long i = 1; i < n; i++) if (arr[i] < m) m = arr[i];
+  return m;
+}
+
+float findRange(float *arr, long n) {
+  return findMax(arr, n) - findMin(arr, n);
+}
+
+float findMedian(float *arr, long n) {
+  static float temp[WINDOW_SIZE];
+  memcpy(temp, arr, sizeof(float) * n);
+  sortArray(temp, n);
+  return (n % 2 == 0) ? (temp[n/2 - 1] + temp[n/2]) / 2.0 : temp[n/2];
+}
+
+float findIQR(float *arr, long n) {
+  static float temp[WINDOW_SIZE];
+  memcpy(temp, arr, sizeof(float) * n);
+  sortArray(temp, n);
+  float p1 = (25 / 100.0) * (n - 1);
+  float p3 = (75 / 100.0) * (n - 1);
+  int i1 = floor(p1), i3 = floor(p3);
+  float ql = temp[i1] + (p1 - i1) * (temp[i1 + 1] - temp[i1]);
+  float qh = temp[i3] + (p3 - i3) * (temp[i3 + 1] - temp[i3]);
+  return qh - ql;
+}
+
+float findVar(float *arr, long n) {
+  float mean = 0.0, sum = 0.0;
+  for (int i = 0; i < n; i++) mean += arr[i];
+  mean /= n;
+  for (int i = 0; i < n; i++) {
+    float d = arr[i] - mean;
+    sum += d * d;
+  }
+  return sum / n; // ddof = 0
+}
+
+float findSkew(float *arr, long n) {
+  float mean = 0.0, m2 = 0.0, m3 = 0.0;
+  for (int i = 0; i < n; i++) mean += arr[i];
+  mean /= n;
+  for (int i = 0; i < n; i++) {
+    float d = arr[i] - mean;
+    m2 += d * d;
+    m3 += d * d * d;
+  }
+  m2 /= n;
+  m3 /= n;
+  if (m2 == 0) return 0.0;
+  return m3 / pow(m2, 1.5);
+}
+
+float findKurtosis(float *arr, long n) {
+  float mean = 0.0, m2 = 0.0, m4 = 0.0;
+  for (int i = 0; i < n; i++) mean += arr[i];
+  mean /= n;
+  for (int i = 0; i < n; i++) {
+    float d = arr[i] - mean;
+    m2 += d * d;
+    m4 += d * d * d * d;
+  }
+  m2 /= n;
+  m4 /= n;
+  if (m2 == 0) return 0.0;
+  return (m4 / (m2 * m2)) - 3.0; // Định nghĩa Fisher (trừ đi 3)
+}
+
+float findMobility(float *arr, long n) {
+  if (n < 2) return 0.0;
+  static float diff1[WINDOW_SIZE];
+  for (int i = 0; i < n - 1; i++) {
+    diff1[i] = arr[i + 1] - arr[i];
+  }
+  float var_x = findVar(arr, n);
+  float var_d1 = findVar(diff1, n - 1);
+  if (var_x == 0) return 0.0;
+  return sqrt(var_d1 / var_x);
+}
+
+float findComplexity(float *arr, long n) {
+  if (n < 3) return 0.0;
+  static float diff1[WINDOW_SIZE];
+  static float diff2[WINDOW_SIZE];
+  for (int i = 0; i < n - 1; i++) {
+    diff1[i] = arr[i + 1] - arr[i];
+  }
+  for (int i = 0; i < n - 2; i++) {
+    diff2[i] = diff1[i + 1] - diff1[i];
+  }
+  float var_x = findVar(arr, n);
+  float var_d1 = findVar(diff1, n - 1);
+  float var_d2 = findVar(diff2, n - 2);
+  if (var_x == 0 || var_d1 == 0) return 0.0;
+  return sqrt(var_d2 / var_d1) / (sqrt(var_d1 / var_x));
+}

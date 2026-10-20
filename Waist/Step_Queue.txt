@@ -1,0 +1,96 @@
+#include "Step_Queue.h"
+
+// Khởi tạo hàng đợi về trạng thái ban đầu
+void stepQueue_Init(StepQueue_t *q) {
+  q->front = -1;
+  q->rear = -1;
+  q->size = STEP_QUEUE_SIZE;
+  memset(q->queueArr, 0, sizeof(q->queueArr));
+}
+
+// Kiểm tra hàng đợi rỗng
+uint8_t stepQueue_IsEmpty(StepQueue_t *q) {
+  return (q->front == -1);
+}
+
+// Kiểm tra hàng đợi đầy
+uint8_t stepQueue_IsFull(StepQueue_t *q) {
+  return ((q->rear + 1) % q->size == q->front);
+}
+
+// Thêm dữ liệu mới vào hàng đợi
+void stepQueue_Push(StepQueue_t *q, uint32_t index, float amagValue) {
+  // Nếu hàng đợi đầy, tự động loại bỏ phần tử cũ nhất (front) để nhường chỗ cho mẫu mới
+  if (stepQueue_IsFull(q)) {
+    stepQueue_Pop(q);
+  }
+
+  if (stepQueue_IsEmpty(q)) {
+    q->front = 0;
+  }
+
+  // Tăng chỉ số rear theo vòng tròn
+  q->rear = (q->rear + 1) % q->size;
+
+  // Nạp dữ liệu vào vị trí mới
+  q->queueArr[q->rear].sampleIndex = index;
+  q->queueArr[q->rear].amag = amagValue;
+}
+
+// Lấy dữ liệu cũ nhất ra khỏi hàng đợi
+StepSample_t stepQueue_Pop(StepQueue_t *q) {
+  StepSample_t blankData = {0, 0.0f};
+  if (stepQueue_IsEmpty(q)) {
+    return blankData;
+  }
+
+  StepSample_t data = q->queueArr[q->front];
+
+  if (q->front == q->rear) { // Nếu hàng đợi chỉ còn đúng 1 phần tử
+    q->front = -1;
+    q->rear = -1;
+  } else {
+    q->front = (q->front + 1) % q->size;
+  }
+  return data;
+}
+
+// Xóa toàn bộ dữ liệu trong hàng đợi
+void stepQueue_Clear(StepQueue_t *q) {
+  q->front = -1;
+  q->rear = -1;
+}
+
+#ifndef STEP_QUEUE_H
+#define STEP_QUEUE_H
+
+#include <stdint.h>
+#include "Arduino.h"
+
+// Cấu hình kích thước hàng đợi bước chân
+// Với HALF_WINDOW = 25, cửa sổ trượt cần tối thiểu 51 mẫu, đặt Size = 60 để có biên dư dả an toàn
+#define STEP_QUEUE_SIZE 60 
+
+// Cấu trúc dữ liệu lưu trữ một mẫu gia tốc RMS
+typedef struct {
+  uint32_t sampleIndex; // Chỉ mục thời gian (tăng dần mỗi 10ms)
+  float amag;           // Giá trị độ lớn gia tốc tổng hợp (đã trừ đi trọng lực)
+} StepSample_t;
+
+// Cấu trúc hàng đợi vòng cấp phát tĩnh
+typedef struct {
+  int16_t front;
+  int16_t rear;
+  int16_t size;
+  StepSample_t queueArr[STEP_QUEUE_SIZE];
+} StepQueue_t;
+
+// Khai báo các hàm quản lý hàng đợi
+void stepQueue_Init(StepQueue_t *q);
+uint8_t stepQueue_IsEmpty(StepQueue_t *q);
+uint8_t stepQueue_IsFull(StepQueue_t *q);
+void stepQueue_Push(StepQueue_t *q, uint32_t index, float amagValue);
+StepSample_t stepQueue_Pop(StepQueue_t *q);
+void stepQueue_Clear(StepQueue_t *q);
+
+#endif // STEP_QUEUE_H

@@ -1,0 +1,61 @@
+#pragma once
+#include <cstdarg>
+#include <cmath> // Thêm thư viện để dùng hàm expf()
+
+namespace Eloquent {
+    namespace ML {
+        namespace Port {
+            class XGBClassifier {
+                public:
+                    /*
+                     * Predict class for features vector
+                     */
+                    // int predict(float *x) {
+                    int predict(float *x, float *probs = nullptr) { // Thêm tham số probs có giá trị mặc định là nullptr
+                        float votes[9] = { 0.0f };
+                        // tree if-else...
+
+                        /*
+                         * Đoạn code if-else gốc của micromlgen giữ nguyên ở trên
+                         * Sau khi chạy xong các lệnh if-else, mảng votes[9] đã có điểm thô.
+                         * Áp dụng thuật toán Softmax để chuyển điểm thô thành xác suất:
+                         */
+                        if (probs != nullptr) {
+                            // Bước 1: Tìm giá trị max_vote để tránh hiện tượng tràn số khi tính hàm mũ exp()
+                            float max_vote = votes[0];
+                            for (uint8_t i = 1; i < 9; i++) {
+                                if (votes[i] > max_vote) max_vote = votes[i];
+                            }
+
+                            // Bước 2: Tính tổng các hàm mũ Softmax (Sum of exponentials)
+                            float sum_exp = 0.0f;
+                            for (uint8_t i = 0; i < 9; i++) {
+                                probs[i] = expf(votes[i] - max_vote); // Trừ max_vote giúp ổn định số học
+                                sum_exp += probs[i];
+                            }
+    
+                            // Bước 3: Chuẩn hóa xác suất để tổng các phần tử trong mảng probs bằng 1.0
+                            for (uint8_t i = 0; i < 9; i++) {
+                                probs[i] /= sum_exp;
+                            }
+                        }
+
+                        /*
+                         * Đoạn code tìm argmax gốc của micromlgen giữ nguyên ở dưới
+                         */
+                        // Return argmax of votes
+                        uint8_t classIdx = 0;
+                        float maxVotes = votes[0];
+                        for (uint8_t i = 1; i < 9; i++) {
+                            if (votes[i] > maxVotes) {
+                                classIdx = i;
+                                maxVotes = votes[i];
+                            }
+                        }
+                        return classIdx;
+                    }
+                protected:
+                };
+            }
+        }
+    }

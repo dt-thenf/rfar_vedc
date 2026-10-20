@@ -1,0 +1,118 @@
+#include <Arduino.h>
+#include <TaskScheduler.h>
+#include "Gas_Module.h"
+#include "Dust_Module.h"
+#include "Data_Struct.h"
+#include "MQTT_Module.h"
+#include "HTTP_Module.h"
+#include "BLE_Receiver.h"
+#include "Altitude_Module.h"
+
+// Hằng số bảo vệ timeout khi mất kết nối BLE (2 giây)
+static const unsigned long BLE_FALLBACK_TIMEOUT_MS = 2000;
+static unsigned long lastPublishTime = 0;
+// Biến đếm chu kỳ để gửi HTTPS mỗi 2 giây
+static uint8_t httpCycleCounter = 0;
+
+// Bộ lập lịch tác vụ hệ thống
+Scheduler runner;
+
+// Tác vụ lấy mẫu cảm biến khí chu kỳ 20 ms (50 Hz)
+void gasSamplingTask();
+Task taskGas(20, TASK_FOREVER, &gasSamplingTask);
+void gasSamplingTask() { processGasData(); }
+
+// Tác vụ lấy mẫu cảm biến bụi mịn chu kỳ 500 ms (2 Hz)
+void dustSamplingTask();
+Task taskDust(500, TASK_FOREVER, &dustSamplingTask);
+void dustSamplingTask() { processDustData(); }
+
+// Tác vụ tính toán độ cao, khí áp và số tầng chu kỳ 100 ms (10 Hz)
+void altitudeSamplingTask();
+Task taskAltitude(100, TASK_FOREVER, &altitudeSamplingTask);
+void altitudeSamplingTask() { processAltitudeData(); }
+
+// Đóng vói và xuất bản dữ liệu tổng hợp
+void processAndPublish(bool hasWaistUpdate) {
+  WaistData waistSnapshot;
+  bool dataAvailable = false;
+  if (hasWaistUpdate) { dataAvailable = getwaistSnapshot(waistSnapshot); }
+  bool waistOnline = isWaistConnected();
+
+  // Đóng gói dữ liệu môi trường tại helmet
+  HelmetData helmetData;
+  helmetData.gasLevel = getGasLevel();
+  helmetData.aqi = getDustAQI();
+  helmetData.pm25 = getPM25();
+  helmetData.pm10 = getPM10();
+  helmetData.temperature = getTemperature();
+  helmetData.pressure = getPressure();
+  helmetData.altitude = getAltitude();
+  helmetData.floor = getFloor();
+  helmetData.coSamples = getCoSamples();
+  helmetData.smokeSamples = getSmokeSamples();
+  helmetData.sampleCount = getGasSampleCount();
+
+  // Xuất bản bản tin tổng hợp lên Broker định kỳ 1 giây
+  if (isMQTTConnected()) {
+    bool pubSuccess = publishTelemetryMQTT(helmetData, dataAvailable ? &waistSnapshot : nullptr, waistOnline);
+    if (pubSuccess) {
+      Serial.printf("[MQTT] Đã phát bản tin | Nguồn: %s | BLE: %s | Dữ liệu waist: %s\n", hasWaistUpdate ? "BLE Event" : "Timeout Fallback", waistOnline ? "Online" : "Offline", dataAvailable ? "Có cập nhật" : "Giữ nguyên/Null");
+    } else {
+      Serial.println(F("[MQTT] Xuất bản bản tin thất bại."));
+    }
+  } else {
+    Serial.println(F("[MQTT] Mất kết nối tới Broker, đang trong tiến trình kết nối lại..."));
+  }
+
+  // Kích hoạt gửi HTTPS mỗi 2 giây, ngay sau khi gói MQTT đã hoàn tất
+  httpCycleCounter++;
+  if (httpCycleCounter >= 2) {
+    httpCycleCounter = 0;
+    // Thực thi trong khoảng thời gian nghỉ an toàn của thiết bị waist
+    unsigned long startHttp = millis();
+    bool httpSuccess = sendTelemetryHTTPS(helmetData, dataAvailable ? &waistSnapshot : nullptr, waistOnline);
+    unsigned long duration = millis() - startHttp;
+    Serial.printf("[HTTP] Trạng thái: %s | Thời gian: %lu ms\n", httpSuccess ? "Thành công" : "Thất bại", duration);
+  }
+  lastPublishTime = millis();
+}
+
+void setup() {
+  Serial.begin(115200);
+  // Khởi tạo cảm biến MQ-9, MQ-135, PM SDS011 và BMP280
+  setupGas();
+  setupDust();
+  setupAltitude(7, 2.8f);
+  // Khởi tạo tầng thu nhận NimBLE Client
+  Serial.println(F("[BLE] Đang khởi tạo NimBLE Client..."));
+  setupBLEReceiver();
+  // Khởi tạo kết nối mạng Wi-Fi, NTP và MQTT Client
+  Serial.println(F("[MQTT] Đang khởi tạo Wi-Fi và MQTT..."));
+  setupMQTT();
+  // Khởi chạy bộ lập lịch tác vụ định thời
+  runner.addTask(taskGas);
+  runner.addTask(taskDust);
+  runner.addTask(taskAltitude);
+  taskGas.enable();
+  taskDust.enable();
+  taskAltitude.enable();
+  lastPublishTime = millis();
+}
+
+void loop() {
+  // Thực thi tác vụ định thời
+  runner.execute();
+  // Duy trì tiến trình kết nối và tiếp nhận gói tin BLE
+  runBLEReceiver();
+  // Duy trì tiến trình mạng và xử lý hàng đợi MQTT
+  runMQTT();
+  // Cơ chế kích hoạt: Ưu tiên sự kiện BLE hoàn thành chu kỳ 1 giây từ waist
+  if (isWaistDataReady()) {
+    processAndPublish(true);
+  }
+  // Cơ chế bảo vệ: Xuất bản dữ liệu môi trường định kỳ nếu BLE bị gián đoạn
+  else if (millis() - lastPublishTime >= BLE_FALLBACK_TIMEOUT_MS) {
+    processAndPublish(false);
+  }
+}

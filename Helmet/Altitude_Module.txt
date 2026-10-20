@@ -1,0 +1,202 @@
+#include <math.h>
+#include <Wire.h>
+#include <Adafruit_BMP280.h>
+#include "Altitude_Module.h"
+
+namespace {
+  Adafruit_BMP280 bmp;
+  bool isBmpReady = false;
+
+  // Hằng số tính toán khí áp và bù nhiệt độ
+  const float P0  = 1013.25f; // Áp suất chuẩn tại mực nước biển (hPa)
+  const float K1  = -0.0250f; // Hệ số bù nhiệt bậc 1
+  const float K2  = -0.0003f; // Hệ số bù nhiệt bậc 2
+  const float TS  = 0.1f;     // Chu kỳ lấy mẫu (100 ms)
+  const float TAU = 4.0f;     // Hằng số thời gian bộ lọc
+
+  // Các biến trạng thái ước lượng tầng và độ cao
+  float height_per_floor = 2.8f;
+  uint8_t start_floor = 1;
+  float t_ref = 25.0f;
+  float h_reference = 0.0f;
+  float bias_k = 0.0f;
+  uint16_t current_floor_offset = 0;
+  float prev_h_star = 0.0f;
+  float current_h_star = 0.0f;
+  uint16_t stable_counter = 0;
+
+  // Trạng thái bộ lọc Kalman 1D thích ứng
+  float kf_x = 1013.25f;
+  float kf_p = 1.0f;
+  float kf_q = 0.005f;
+  float kf_r = 0.30f;
+  float kf_k = 0.0f;
+  float prev_raw_p = 1013.25f;
+
+  // Dữ liệu đo tức thời
+  float current_temp = 25.0f;
+  float current_press = 1013.25f;
+
+  // Các biến quản lý hiệu chuẩn ban đầu
+  bool isCalibrated = false;
+  uint8_t calibSampleCount = 0;
+  const uint8_t CALIB_TARGET_SAMPLES = 25;
+  float sum_p = 0.0f, sum_t = 0.0f;
+
+  float computeDeltaP(float t_meas) {
+    float delta_T = t_meas - t_ref;
+    return delta_T * (K1 + K2 * delta_T);
+  }
+
+  float calculateBarometricAltitude(float pressure_mbar) {
+    return 44330.0f * (1.0f - powf((pressure_mbar / P0), (1.0f / 5.255f)));
+  }
+
+  float updateKalman(float measurement, float dynamic_q) {
+    kf_q = dynamic_q;
+    kf_p = kf_p + kf_q;
+    kf_k = kf_p / (kf_p + kf_r);
+    kf_x = kf_x + kf_k * (measurement - kf_x);
+    kf_p = (1.0f - kf_k) * kf_p;
+    return kf_x;
+  }
+
+  int16_t updateSchmittTrigger(float alt, int16_t current_offset) {
+    float current_nominal_h = (float)current_offset * height_per_floor;
+    const float THRESHOLD = height_per_floor * 0.60f;
+    if ((alt - current_nominal_h) <= -THRESHOLD) {
+      current_offset--;
+    } else if ((alt - current_nominal_h) >= THRESHOLD) {
+      current_offset++;
+    }
+    return current_offset;
+  }
+} // namespace
+
+bool setupAltitude(int8_t startFloorVal, float floorHeightVal) {
+  height_per_floor = floorHeightVal;
+  start_floor = startFloorVal;
+
+  // Dò tìm cảm biến BMP280 trên bus I2C (địa chỉ 0x76 hoặc 0x77)
+  if (bmp.begin(0x76)) {
+    isBmpReady = true;
+  } else if (bmp.begin(0x77)) {
+    isBmpReady = true;
+  } else {
+    Serial.println(F("Không tìm thấy cảm biến BMP280!"));
+    return false;
+  }
+  // Cấu hình chế độ đo bình thường với bộ lọc IIR khử nhiễu
+  bmp.setSampling(Adafruit_BMP280::MODE_NORMAL, Adafruit_BMP280::SAMPLING_X2, Adafruit_BMP280::SAMPLING_X16, Adafruit_BMP280::FILTER_X16, Adafruit_BMP280::STANDBY_MS_63);
+
+  // Đặt lại các biến hiệu chuẩn
+  isCalibrated = false;
+  calibSampleCount = 0;
+  sum_p = 0.0f, sum_t = 0.0f;
+  return true;
+}
+
+void processAltitudeData() {
+  if (!isBmpReady) return;
+  float raw_temp = bmp.readTemperature();
+  float raw_pressure = bmp.readPressure() / 100.0f; // Pa -> hPa
+  if (!isfinite(raw_temp) || !isfinite(raw_pressure)) return;
+  current_temp = raw_temp;
+  current_press = raw_pressure;
+
+  if (!isCalibrated) {
+    sum_p += raw_pressure;
+    sum_t += raw_temp;
+    calibSampleCount++;
+
+    if (calibSampleCount >= CALIB_TARGET_SAMPLES) {
+      float init_p = sum_p / (float)CALIB_TARGET_SAMPLES;
+      float init_t = sum_t / (float)CALIB_TARGET_SAMPLES;
+
+      t_ref = init_t;
+      kf_x = init_p;
+      kf_p = 1.0f;
+      kf_q = 0.005f;
+      prev_raw_p = init_p;
+
+      float p_comp = init_p - computeDeltaP(t_ref);
+      float p_filt = updateKalman(p_comp, 0.005f);
+      h_reference = calculateBarometricAltitude(p_filt);
+
+      bias_k = 0.0f;
+      current_floor_offset = 0;
+      prev_h_star = 0.0f;
+      current_h_star = 0.0f;
+      stable_counter = 0;
+
+      current_press = init_p;
+      isCalibrated = true;
+      Serial.printf("Hiệu chuẩn thành công | P_ref: %.2f hPa | T_ref: %.2f *C\n", init_p, init_t);
+    }
+    return;
+  }
+
+  // Bù sai số trôi theo nhiệt độ
+  float delta_p = computeDeltaP(raw_temp);
+  float p_comp = raw_pressure - delta_p;
+
+  // Tính sai phân áp suất xác định hiệp phương sai nhiễu quá trình Q thích ứng
+  float dp_dt = fabsf(raw_pressure - prev_raw_p);
+  prev_raw_p = raw_pressure;
+  float dynamic_q = (dp_dt > 0.08f) ? 0.15f : 0.005f;
+
+  // Lọc Kalman
+  float p_kalman = updateKalman(p_comp, dynamic_q);
+  current_press = p_kalman;
+
+  // Tính độ cao tương đối
+  float h_absolute = calculateBarometricAltitude(p_kalman);
+  float h_relative = h_absolute - h_reference;
+  current_h_star = h_relative - bias_k;
+
+  // Cập nhật tầng nhà thông qua ngưỡng trễ
+  current_floor_offset = updateSchmittTrigger(current_h_star, current_floor_offset);
+
+  // Hiệu chỉnh độ trôi độ cao tĩnh khi đứng yên > 2.5 giây
+  float delta_h = fabsf(current_h_star - prev_h_star);
+  if (delta_h < 0.05f) {
+    stable_counter++;
+  } else {
+    stable_counter = 0;
+  }
+
+  if (stable_counter > 25) {
+    float h_nominal = (float)current_floor_offset * height_per_floor;
+    float error = current_h_star - h_nominal;
+    if (fabsf(error) < 0.9f) {
+      float alpha = TS / (TAU + TS);
+      bias_k = bias_k + alpha * error;
+    }
+  }
+  prev_h_star = current_h_star;
+}
+
+float getTemperature() { return current_temp; }
+float getPressure() { return current_press; }
+float getAltitude() { return current_h_star;}
+uint8_t getFloor()  { return (uint8_t)(start_floor + current_floor_offset); }
+
+#ifndef ALTITUDE_MODULE_H
+#define ALTITUDE_MODULE_H
+
+#include <Arduino.h>
+
+// Khởi tạo cảm biến BMP280 và xác định áp suất/nhiệt độ mốc ban đầu
+bool setupAltitude(int8_t startFloor = 1, float floorHeight = 2.8f);
+// Tiến trình đọc cảm biến, lọc Kalman và ước lượng tầng
+void processAltitudeData();
+// Lấy nhiệt độ môi trường (độ C)
+float getTemperature();
+// Lấy áp suất khí quyển (hPa)
+float getPressure();
+// Lấy độ cao tương đối so với vị trí khởi tạo (m)
+float getAltitude();
+// Lấy số tầng ước lượng hiện tại
+uint8_t getFloor();
+
+#endif // ALTITUDE_MODULE_H

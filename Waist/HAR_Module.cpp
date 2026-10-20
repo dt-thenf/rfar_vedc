@@ -1,0 +1,331 @@
+#include <cmath>
+#include "features.h"
+#include "HAR_Module.h"
+#include "micromlgen_XGB_w200_s000.h"
+Eloquent::ML::Port::XGBClassifier model_XGB;
+
+float window_x[WINDOW_SIZE], window_y[WINDOW_SIZE], window_z[WINDOW_SIZE];
+float vector_feature[36];
+uint16_t c_data  = 0;
+uint8_t actAlert = 0, fl_counter = 0;
+String human_act[] = {"LY", "SI", "ST", "WA", "JO", "WS", "CR", "SL", "FA"};
+String rawAct = "", hmmAct = "", pre_act = "";
+boolean is_transitioning = false;
+
+// Kiểm tra các cặp hành động được phép chuyển trực tiếp không qua TS
+static inline bool canTransitionDirectly(const String &from, const String &to) {
+  if (from == "ST" && (to == "WA" || to == "WS" || to == "JO" || to == "FA")) return true;
+  if (from == "WA" && (to == "ST" || to == "WS" || to == "JO" || to == "FA")) return true;
+  if (from == "WS" && (to == "ST" || to == "WA" || to == "JO" || to == "FA")) return true;
+  if (from == "JO" && (to == "ST" || to == "WA" || to == "WS" || to == "FA")) return true;
+  return false;
+}
+
+// Ma trận xác suất chuyển trạng thái A ở dạng Log-scale (tính toán bằng ln[(x + 1e-12))]
+//A = np.array([
+//         LY      SI      ST      WA      JO      WS      CR      SL      FA
+//    [0.9000, 0.0500, 0.0000, 0.0000, 0.0000, 0.0000, 0.0250, 0.0250, 0.0000], LY
+//    [0.1000, 0.8000, 0.1000, 0.0000, 0.0000, 0.0000, 0.0000, 0.0000, 0.0000], SI
+//    [0.0000, 0.1000, 0.6000, 0.2000, 0.0150, 0.0800, 0.0000, 0.0000, 0.0050], ST
+//    [0.0000, 0.0000, 0.1200, 0.7500, 0.0150, 0.1100, 0.0000, 0.0000, 0.0050], WA
+//    [0.0000, 0.0000, 0.0900, 0.2200, 0.6500, 0.0300, 0.0000, 0.0000, 0.0100], JO
+//    [0.0000, 0.0000, 0.0800, 0.2000, 0.0100, 0.7050, 0.0000, 0.0000, 0.0050], WS
+//    [0.1000, 0.0000, 0.0000, 0.0000, 0.0000, 0.0000, 0.7500, 0.1500, 0.0000], CR
+//    [0.1500, 0.0000, 0.0000, 0.0000, 0.0000, 0.0000, 0.1500, 0.7000, 0.0000], SL
+//    [0.8000, 0.0000, 0.0000, 0.2000, 0.0000, 0.0000, 0.0000, 0.0000, 0.0000]  FA
+//])
+const float log_A[N_STATES][N_STATES] = {
+//         LY          SI          ST         WA           JO          WS          CR          SL          FA
+  { -0.105361,  -2.995732, -27.631021, -27.631021, -27.631021, -27.631021,  -3.688879,  -3.688879, -27.631021}, // LY
+  { -2.302585,  -0.223144,  -2.302585, -27.631021, -27.631021, -27.631021, -27.631021, -27.631021, -27.631021}, // SI
+  {-27.631021,  -2.302585,  -0.510826,  -1.609438,  -4.199705,  -2.525729, -27.631021, -27.631021,  -5.298317}, // ST
+  {-27.631021, -27.631021,  -2.120264,  -0.287682,  -4.199705,  -2.207275, -27.631021, -27.631021,  -5.298317}, // WA
+  {-27.631021, -27.631021,  -2.407946,  -1.514128,  -0.430783,  -3.506558, -27.631021, -27.631021,  -4.605170}, // JO
+  {-27.631021, -27.631021,  -2.525729,  -1.609438,  -4.605170,  -0.349566, -27.631021, -27.631021,  -5.298317}, // WS
+  { -2.302585, -27.631021, -27.631021, -27.631021, -27.631021, -27.631021,  -0.287682,  -1.897120, -27.631021}, // CR
+  { -1.897120, -27.631021, -27.631021, -27.631021, -27.631021, -27.631021,  -1.897120,  -0.356675, -27.631021}, // SL
+  { -0.223144, -27.631021, -27.631021,  -1.609438, -27.631021, -27.631021, -27.631021, -27.631021, -27.631021}  // FA
+};
+// Xác suất khởi đầu đồng đều ở dạng Log-scale: log(1.0 / 9.0)
+const float log_start[N_STATES] = {-2.197225, -2.197225, -2.197225, -2.197225, -2.197225, -2.197225, -2.197225, -2.197225, -2.197225};
+// Cấu trúc hàng đợi vòng lưu trữ Log_B (Ma trận phát xạ từ predict_proba của XGBoost)
+float hmm_buffer[T_WINDOW][N_STATES];
+// Biến đếm số lượng cửa sổ hiện có trong hàng đợi
+int hmm_count = 0;
+// Lưu chỉ số hành động chốt của chu kỳ trước
+int last_resolved_state_idx = -1;
+
+// Hàm cấu trúc đẩy dữ liệu xác suất mới vào hàng đợi vòng
+void push_to_hmm_buffer(float* probs) {
+  if (hmm_count < T_WINDOW) {
+    // Giai đoạn khởi động: chưa đầy bộ đệm, nạp tuần tự
+    for (int s = 0; s < N_STATES; s++) {
+      hmm_buffer[hmm_count][s] = logf(probs[s] + EPSILON);
+    }
+    hmm_count++;
+  } else {
+    // Bộ đệm đã đầy: Dịch chuyển các phần tử cũ lên trước (tịnh tiến 1 cửa sổ)
+    for (int t = 0; t < T_WINDOW - 1; t++) {
+      for (int s = 0; s < N_STATES; s++) {
+        hmm_buffer[t][s] = hmm_buffer[t + 1][s];
+      }
+    }
+    // Thêm phần tử mới vào cuối hàng đợi
+    for (int s = 0; s < N_STATES; s++) {
+      hmm_buffer[T_WINDOW - 1][s] = logf(probs[s] + EPSILON);
+    }
+  }
+}
+
+// Thuật toán Viterbi giải mã chuỗi tối ưu trong bộ đệm
+int update_viterbi() {
+  // Nếu bộ đệm chưa đầy, trả về nhãn khẩn cấp tạm thời
+  if (hmm_count < T_WINDOW) {
+    return -1; 
+  }
+
+  float viterbi[T_WINDOW][N_STATES];
+  int backpointer[T_WINDOW][N_STATES];
+
+  // Bước 1: Khởi tạo bước quy hoạch động đầu tiên (tại bước thời gian t = 0)
+  if (last_resolved_state_idx == -1) {
+    // Cửa sổ đầu tiên: Cho phép tự do theo log_start
+    for (int s = 0; s < N_STATES; s++) {
+      viterbi[0][s] = log_start[s] + hmm_buffer[0][s];
+    }
+  } else {
+    // Các cửa sổ tiếp theo: Ô đầu chuỗi (t=0) đi tiếp từ kết quả của chu kỳ trước
+    for (int s = 0; s < N_STATES; s++) {
+      viterbi[0][s] = log_A[last_resolved_state_idx][s] + hmm_buffer[0][s];
+    }
+  }
+
+  // Bước 2: Tiến hành quy hoạch động (đệ quy từ bước thời gian t = 1 đến T_WINDOW - 1)
+  for (int t = 1; t < T_WINDOW; t++) {
+    for (int s = 0; s < N_STATES; s++) {
+      float max_score = -INFINITY;
+      int best_ptr = 0;
+
+      for (int prev_s = 0; prev_s < N_STATES; prev_s++) {
+        float score = viterbi[t - 1][prev_s] + log_A[prev_s][s];
+        if (score > max_score) {
+          max_score = score;
+          best_ptr = prev_s;
+        }
+      }
+      backpointer[t][s] = best_ptr;
+      viterbi[t][s] = max_score + hmm_buffer[t][s];
+    }
+  }
+
+  // Bước 3: Truy vết ngược tìm chuỗi nhãn tối ưu
+  int path[T_WINDOW];
+  float max_final_score = -INFINITY;
+  int best_final_state = 0;
+
+  for (int s = 0; s < N_STATES; s++) {
+    if (viterbi[T_WINDOW - 1][s] > max_final_score) {
+      max_final_score = viterbi[T_WINDOW - 1][s];
+      best_final_state = s;
+    }
+  }
+
+  path[T_WINDOW - 1] = best_final_state;
+  for (int t = T_WINDOW - 2; t >= 0; t--) {
+    path[t] = backpointer[t + 1][path[t + 1]];
+  }
+
+  // Lưu vết lịch sử: Ghi nhớ nhãn ô đầu chuỗi để làm mốc cho chu kỳ sau
+  last_resolved_state_idx = path[0];
+  // Trả về nhãn ở vị trí cũ nhất (index 0) - nhãn có độ ổn định và chính xác cao nhất
+  return path[0];
+}
+
+void setupHAR() {
+  rawAct = "", hmmAct = "", pre_act = "";
+  is_transitioning = false;
+  fl_counter = 0;
+  hmm_count = 0;
+  actAlert = 0;
+  c_data = 0;
+  memset(window_x, 0, sizeof(window_x));
+  memset(window_y, 0, sizeof(window_y));
+  memset(window_z, 0, sizeof(window_z));
+}
+
+void processHARData(float accX, float accY, float accZ) {
+  if (c_data < WINDOW_SIZE) {
+    window_x[c_data] = accX;
+    window_y[c_data] = accY;
+    window_z[c_data] = accZ;
+    c_data++;
+  }
+
+  if (c_data >= WINDOW_SIZE) {
+    // Trích xuất đặc trưng
+    extractFeatures(window_x, window_y, window_z, vector_feature, WINDOW_SIZE);
+    // Mảng chứa xác suất phát xạ từ hàm bổ sung trong micromlgen
+    float current_probs[N_STATES] = { 0.0f };
+    // Gọi hàm predict để lấy nhãn thô (num_) và mảng xác suất (current_probs)
+    int num_ = model_XGB.predict(vector_feature, current_probs);
+    String new_act = human_act[num_];
+    String cur_act = "";
+
+    // Loại bỏ nhận diện sai FA khi đang ở trạng thái LY/SI/CR/SL
+    if ((pre_act == "LY" || pre_act == "SI" || pre_act == "CR" || pre_act == "SL") && new_act == "FA") {
+      new_act = pre_act;
+    }
+
+    /*
+     * Luồng 1: Heuristic thời gian thực
+     */
+    // Nhánh 1: Ưu tiên xử lý FA/FL
+    if (new_act == "FA") {
+      cur_act = "FA", pre_act = "FA";
+      fl_counter = 0;
+      is_transitioning = false;
+    }
+    // Xác nhận ngã bất động (FL) lần 1 khi chuỗi FA -> LY xảy ra
+    else if (pre_act == "FA" && new_act == "LY") {
+      cur_act = "FL", pre_act = "FL";
+      fl_counter = 1;
+      is_transitioning = false;
+    }
+    // Duy trì cảnh báo FL lần 2 nếu tiếp tục nằm bất động
+    else if (pre_act == "FL" && fl_counter == 1 && new_act == "LY") {
+      cur_act = "FL", pre_act = "FL";
+      fl_counter = 2;
+      is_transitioning = false;
+    }
+    // Sau 2 lần phát cảnh báo FL, tiếp nhận trực tiếp kết quả dự đoán không qua TS
+    else if (pre_act == "FL" && fl_counter >= 2) {
+      cur_act = new_act;
+      pre_act = cur_act;
+      fl_counter = 0;
+      is_transitioning = false;
+    }
+
+    // Nhánh 2: Các hoạt động ADLs
+    else {
+      fl_counter = 0;
+      // TH1: Chu kỳ trước là TS, tiếp nhận trực tiếp kết quả dự đoán
+      if (is_transitioning) {
+        cur_act = new_act;
+        pre_act = cur_act;
+        is_transitioning = false;
+      }
+      // TH2: Chu kỳ trước là trạng thái ổn định
+      else if (new_act == pre_act) {
+        cur_act = pre_act;
+      }
+      // TH3: Chuyển đổi thuộc nhóm được phép bỏ qua TS
+      else if (canTransitionDirectly(pre_act, new_act)) {
+        cur_act = new_act;
+        pre_act = cur_act;
+        is_transitioning = false;
+      }
+      // TH4: Chuyển dổi bắt buộc qua TS
+      else {
+        cur_act = "TS";
+        is_transitioning = true;
+      }
+    }
+    rawAct = cur_act;
+    actAlert = (rawAct == "FA" || rawAct == "FL") ? 1 : 0;
+
+    /*
+     * Luồng 2: HMM Viterbi để sửa lỗi nhận dạng đơn lẻ
+     */
+    // Đẩy mảng xác suất thô của cửa sổ này vào hàng đợi vòng HMM
+    push_to_hmm_buffer(current_probs);
+    // Chạy thuật toán giải mã Viterbi thời gian thực
+    int hmm_resolved_idx = update_viterbi();
+    // Cập nhật nhãn lịch sử nếu bộ đệm đã tích lũy đủ cửa sổ
+    if (hmm_resolved_idx != -1) {
+      hmmAct = human_act[hmm_resolved_idx];
+    } else {
+      hmmAct = "IN"; // Giai đoạn khởi động
+    }
+
+    printHMMReport(new_act);
+//    memmove(window_x, &window_x[OVERLAP_SIZE], sizeof(float) * OVERLAP_SIZE);
+//    memmove(window_y, &window_y[OVERLAP_SIZE], sizeof(float) * OVERLAP_SIZE);
+//    memmove(window_z, &window_z[OVERLAP_SIZE], sizeof(float) * OVERLAP_SIZE);
+//    c_data = OVERLAP_SIZE;
+    c_data = 0;
+    memset(window_x, 0, sizeof(window_x));
+    memset(window_y, 0, sizeof(window_y));
+    memset(window_z, 0, sizeof(window_z));
+  }
+}
+
+String getRawAct() { return rawAct; }
+String getHMMAct() { return hmmAct; }
+uint8_t getActAlert() { return actAlert; }
+
+void printHMMReport(String new_act) {
+  Serial.print("[ML base] Mô hình dự đoán gốc ML: "); Serial.println(new_act);
+  Serial.print("[Luồng 1] Kết quả heuristic (lên app/web): "); 
+  if (rawAct == "TS") {
+    Serial.println("TS (đang chuyển tư thế...)");
+  } else if (rawAct == "FA" || rawAct == "FL") {
+    Serial.println(rawAct + " (Cảnh báo nguy hiểm!)");
+  } else {
+    Serial.println(rawAct);
+  }
+
+  Serial.println("[Luồng 2] Diễn biến sửa lỗi của HMM Viterbi qua bộ đệm 4 cửa sổ:");
+  if (hmm_count < T_WINDOW) {
+    Serial.printf("          System booting... Đang tích lũy bộ đệm (%d/%d cửa sổ)\n", hmm_count, T_WINDOW);
+  } else {
+    // Tái cấu trúc lại thuật toán Viterbi nội bộ để lấy toàn bộ chuỗi tối ưu thay vì chỉ lấy ô đầu tiên
+    float viterbi[T_WINDOW][N_STATES];
+    int backpointer[T_WINDOW][N_STATES];
+
+    // Tìm lại nhãn lịch sử của chu kỳ trước đó nữa để phục dựng lại đúng chuỗi giải mã
+    // Để chính xác và đơn giản nhất, ta lấy mẫu từ hàm chính đã chạy bằng cách dùng chính last_resolved_state_idx
+    // Tuy nhiên để in chuỗi mượt mà, ta giải mã dựa trên điểm neo thực tế của hàm chính:
+    int prev_anchor = -1;
+    for(int i=0; i<N_STATES; i++) {
+      if(human_act[i] == hmmAct) {
+        // Truy vết ngược tìm trạng thái trước đó dựa trên con đường tối ưu
+        // Để đồng bộ tuyệt đối chuỗi mũi tên với nhãn chốt, ta ép t=0 xuất phát từ nhãn đã chốt
+        prev_anchor = i;
+        break;
+      }
+    }
+
+    for (int s = 0; s < N_STATES; s++) {
+      if (prev_anchor != -1 && s == prev_anchor) viterbi[0][s] = 0.0f + hmm_buffer[0][s];
+      else if (prev_anchor != -1) viterbi[0][s] = -INFINITY;
+      else viterbi[0][s] = log_start[s] + hmm_buffer[0][s];
+    }
+
+    for (int t = 1; t < T_WINDOW; t++) {
+      for (int s = 0; s < N_STATES; s++) {
+        float max_score = -INFINITY; int best_ptr = 0;
+        for (int prev_s = 0; prev_s < N_STATES; prev_s++) {
+          float score = viterbi[t - 1][prev_s] + log_A[prev_s][s];
+          if (score > max_score) { max_score = score; best_ptr = prev_s; }
+        }
+        backpointer[t][s] = best_ptr; viterbi[t][s] = max_score + hmm_buffer[t][s];
+      }
+    }
+
+    int path[T_WINDOW]; float max_final_score = -INFINITY; int best_final_state = 0;
+    for (int s = 0; s < N_STATES; s++) {
+      if (viterbi[T_WINDOW - 1][s] > max_final_score) { max_final_score = viterbi[T_WINDOW - 1][s]; best_final_state = s; }
+    }
+    path[T_WINDOW - 1] = best_final_state;
+    for (int t = T_WINDOW - 2; t >= 0; t--) path[t] = backpointer[t + 1][path[t + 1]];
+
+    // In chuỗi hành động được HMM sửa đổi theo thời gian thực
+    Serial.print("          Chuỗi tối ưu: ");
+    for (int t = 0; t < T_WINDOW; t++) {
+      Serial.print("[" + human_act[path[t]] + "]");
+      if (t < T_WINDOW - 1) Serial.print(" -> ");
+    }
+    Serial.println(); Serial.println("                          └── Chốt gửi nhãn lịch sử: " + hmmAct);
+  }
+  Serial.println();
+}
