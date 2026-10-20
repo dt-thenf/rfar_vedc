@@ -117,8 +117,8 @@ namespace {
    */
   static const float MAGNETIC_DECLINATION_DEG = 0.0f;
 
-  static const float DEG_TO_RAD = 0.01745329251994329577f;
-  static const float RAD_TO_DEG = 57.29577951308232f;
+  static const float LOCAL_DEG_TO_RAD = 0.01745329251994329577f;
+  static const float LOCAL_RAD_TO_DEG = 57.29577951308232f;
 
   static const float MAG_FIELD_MIN_UT = 10.0f;
   static const float MAG_FIELD_MAX_UT = 100.0f;
@@ -154,7 +154,7 @@ namespace {
 
       if (isfinite(gyroDps.x) && isfinite(gyroDps.y) &&
           isfinite(gyroDps.z) && dt > 0.0f) {
-        const Vec3 omega = vScale(gyroDps, DEG_TO_RAD);
+        const Vec3 omega = vScale(gyroDps, LOCAL_DEG_TO_RAD);
 
         // In body coordinates: d(up)/dt = up x angular_velocity.
         const Vec3 derivative = vCross(upBody, omega);
@@ -240,7 +240,7 @@ namespace {
 
     const float sinAngle = vDot(up, vCross(forwardHorizontal, northHorizontal));
     const float cosAngle = vDot(northHorizontal, forwardHorizontal);
-    const float magneticHeading = atan2f(sinAngle, cosAngle) * RAD_TO_DEG;
+    const float magneticHeading = atan2f(sinAngle, cosAngle) * LOCAL_RAD_TO_DEG;
 
     outHeadingDeg = wrap360(magneticHeading + MAGNETIC_DECLINATION_DEG);
     return isfinite(outHeadingDeg);
