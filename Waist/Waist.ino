@@ -106,7 +106,7 @@ void mainSystemTask() {
       getStepDistance(),
       getCompassValue(),
       getCompassHeading(),
-      getPositionY(),
+      getPositionX(),
       getPositionY(),
       main_ble_samples
     );
